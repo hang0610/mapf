@@ -81,6 +81,23 @@ This will:
 - Sample 10 agents from the scenario file
 - Display start and goal positions for each agent
 
+### Run CBS (Conflict-Based Search)
+
+Plan with the included **sum-of-costs CBS** solver (4-connected) and write `paths.npy`:
+
+```bash
+python -m scripts.run_cbs --map random-32-32-10 --k 10 --out paths.npy
+```
+
+Optional: `--max_time 256` increases the space–time search horizon if no solution is found; `--validate` runs `validate_paths` after planning.
+
+Then validate and visualize as usual:
+
+```bash
+python -m scripts.validate_paths paths.npy --map random-32-32-10 --k 10
+python -m scripts.playback_paths --map random-32-32-10 --paths paths.npy --k 10 --out results/cbs_demo.gif --fps 6
+```
+
 ### Validate Paths
 
 Validate a solution path file:
@@ -277,6 +294,8 @@ mapf/
 │   ├── env.py              # MAPF environment implementation
 │   ├── instance.py         # MAPF instance representation
 │   └── validate.py         # Path validation logic
+├── planners/               # MAPF planners
+│   └── cbs.py              # Conflict-Based Search (sum-of-costs, 4-connected)
 ├── mapf_env/               # MAPF environment package
 │   ├── io/                 # Input/output utilities
 │   │   ├── movingai_map.py # Map file loading
@@ -286,6 +305,7 @@ mapf/
 │       └── animate.py      # Path animation
 ├── scripts/                 # Command-line tools
 │   ├── sample_instance.py  # Sample MAPF instances
+│   ├── run_cbs.py          # Run CBS planner → paths.npy
 │   ├── validate_paths.py   # Validate path solutions
 │   ├── playback_paths.py   # Create animated GIFs
 │   ├── preview_map.py      # Preview map files
