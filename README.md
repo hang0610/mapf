@@ -98,6 +98,18 @@ python -m scripts.validate_paths paths.npy --map random-32-32-10 --k 10
 python -m scripts.playback_paths --map random-32-32-10 --paths paths.npy --k 10 --out results/cbs_demo.gif --fps 6
 ```
 
+#### CBS run statistics and conflict-tree log
+
+To record a **single JSON summary** of the run and a **JSONL trace** of each high-level CBS node expansion, pass `--stats_json` and `--log_ct`:
+
+```bash
+python -m scripts.run_cbs --map random-32-32-10 --k 10 --out paths.npy \
+  --stats_json cbs_stats.json --log_ct data/ct_run.jsonl
+```
+
+- **`cbs_stats.json`** (from `--stats_json`): Run-level metrics—wall time, success or timeout, conflict-tree nodes popped, children enqueued, max open-list size, sum of costs, plus the map/scenario paths and planner options used for that run.
+- **`ct_run.jsonl`** (from `--log_ct`): One JSON object per line, each describing a conflict-tree expansion (instrumentation for analysis or learning). Optional `--log_ct_features` adds per-conflict feature vectors; rollout labeling flags (`--rollout_max_pops`, etc.) attach extra fields when enabled—see `python -m scripts.run_cbs --help`.
+
 ### Validate Paths
 
 Validate a solution path file:

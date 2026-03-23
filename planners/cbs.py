@@ -4,10 +4,19 @@
 from __future__ import annotations
 
 import heapq
+import time
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Literal, Optional, Tuple
 
 import numpy as np
+
+from planners.conflict_features import (
+    FEATURE_NAMES,
+    compute_all_conflict_features,
+    conflict_to_dict,
+)
+
+ConflictPolicy = Literal["earliest", "random"]
 
 # Constraint tuples (per agent):
 # Vertex: ("v", t, r, c) — cannot occupy (r, c) at time t
@@ -155,14 +164,17 @@ def _pad_paths_to_array(
     return out
 
 
-def _find_conflict(
+def enumerate_conflicts(
     paths: List[List[Tuple[int, int]]],
     goals: np.ndarray,
-) -> Optional[Tuple]:
+) -> List[Tuple]:
     """
-    First conflict: ('vertex', t, r, c, ai, aj) or ('edge', t, ar, ac, br, bc, ai, aj).
+    All conflicts in deterministic order: every vertex conflict (by t, i, j), then
+    every edge (swap) conflict (by t, i, j). Same tuple layout as branching uses.
     """
     N = len(paths)
+    if N < 2:
+        return []
     goal_tuples = [(int(goals[i, 0]), int(goals[i, 1])) for i in range(N)]
     costs = [_first_goal_index(paths[i], goal_tuples[i]) for i in range(N)]
     T = max(c + 1 for c in costs)
@@ -177,12 +189,13 @@ def _find_conflict(
             return g
         return g
 
+    out: List[Tuple] = []
     for t in range(T):
         for i in range(N):
             for j in range(i + 1, N):
                 a, b = pos(i, t), pos(j, t)
                 if a == b:
-                    return ("vertex", t, a[0], a[1], i, j)
+                    out.append(("vertex", t, a[0], a[1], i, j))
 
     for t in range(1, T):
         for i in range(N):
@@ -192,17 +205,90 @@ def _find_conflict(
                 cti = pos(i, t)
                 ctj = pos(j, t)
                 if pti == ctj and ptj == cti and pti != cti:
-                    # i moves pti->cti, j moves ptj->ctj (swap)
-                    return ("edge", t, pti[0], pti[1], cti[0], cti[1], ptj[0], ptj[1], ctj[0], ctj[1], i, j)
+                    out.append(
+                        (
+                            "edge",
+                            t,
+                            pti[0],
+                            pti[1],
+                            cti[0],
+                            cti[1],
+                            ptj[0],
+                            ptj[1],
+                            ctj[0],
+                            ctj[1],
+                            i,
+                            j,
+                        )
+                    )
+    return out
 
-    return None
+
+def choose_conflict(
+    conflicts: List[Tuple],
+    policy: ConflictPolicy,
+    rng: Optional[np.random.Generator],
+) -> Tuple:
+    if not conflicts:
+        raise ValueError("choose_conflict: empty conflict list")
+    if policy == "earliest":
+        return conflicts[0]
+    if policy == "random":
+        r = rng if rng is not None else np.random.default_rng()
+        return conflicts[int(r.integers(0, len(conflicts)))]
+    raise ValueError(f"unknown conflict policy {policy!r}")
+
+
+def _find_conflict(
+    paths: List[List[Tuple[int, int]]],
+    goals: np.ndarray,
+) -> Optional[Tuple]:
+    """First conflict in ``enumerate_conflicts`` order (legacy helper)."""
+    xs = enumerate_conflicts(paths, goals)
+    return xs[0] if xs else None
 
 
 @dataclass
 class _CTNode:
+    node_id: int
+    parent_id: Optional[int]
+    depth: int
     cost: int
     constraints: Dict[int, FrozenSet[Constraint]]
     paths: List[List[Tuple[int, int]]]
+
+
+@dataclass
+class RolloutLabelConfig:
+    """
+    Bounded CBS continuation from each child of a conflict split (Week 5–6 labeling).
+
+    For every candidate conflict c at a node, we build CBS children, then run a
+    capped high-level search from each child. Pops and solve flags become targets.
+    """
+
+    max_ct_pops: int
+    wall_time_s: Optional[float] = None
+    policy: ConflictPolicy = "earliest"
+
+
+@dataclass
+class CBSSolveStats:
+    """
+    High-level CBS run metrics (cheap observability; not per-conflict logging).
+
+    - ct_nodes_popped: CT nodes removed from the open list and expanded.
+    - ct_children_enqueued: child CT nodes successfully pushed after low-level replans.
+    - max_open_size: peak high-level open-list size.
+    - sum_of_costs: SOC at the goal node when success; else None.
+    """
+
+    success: bool
+    timed_out: bool
+    ct_nodes_popped: int
+    ct_children_enqueued: int
+    max_open_size: int
+    sum_of_costs: Optional[int]
 
 
 class CBSSolver:
@@ -216,12 +302,28 @@ class CBSSolver:
         starts: np.ndarray,
         goals: np.ndarray,
         max_time: int = 128,
+        wall_time_limit_s: Optional[float] = None,
+        *,
+        conflict_policy: ConflictPolicy = "earliest",
+        rng: Optional[np.random.Generator] = None,
+        on_ct_expand: Optional[Callable[[dict], None]] = None,
+        ct_log_features: bool = False,
+        log_context: Optional[Dict[str, Any]] = None,
+        rollout_label_config: Optional[RolloutLabelConfig] = None,
     ):
         self.grid = grid
         self.starts = starts.astype(int)
         self.goals = goals.astype(int)
         self.N = starts.shape[0]
         self.max_time = max_time
+        self.wall_time_limit_s = wall_time_limit_s
+        self.last_stats: Optional[CBSSolveStats] = None
+        self.conflict_policy = conflict_policy
+        self.rng = rng
+        self.on_ct_expand = on_ct_expand
+        self.ct_log_features = ct_log_features
+        self.log_context = dict(log_context) if log_context else {}
+        self.rollout_label_config = rollout_label_config
 
     def _plan_one(
         self,
@@ -252,78 +354,328 @@ class CBSSolver:
             total += _path_cost(paths[i], g)
         return total
 
+    def _branch_children(
+        self,
+        parent: _CTNode,
+        conflict: Tuple,
+        *,
+        start_nid: int,
+    ) -> Tuple[List[_CTNode], int]:
+        """CBS split on ``conflict``; returns (children, next free node id)."""
+        children: List[_CTNode] = []
+        nid = start_nid
+        if conflict[0] == "vertex":
+            _, t, r, c, ai, aj = conflict
+            for child_agent, _other in ((ai, aj), (aj, ai)):
+                vcon: Constraint = ("v", t, r, c)
+                new_cons = dict(parent.constraints)
+                new_cons[child_agent] = frozenset(new_cons[child_agent]) | {vcon}
+                new_paths = [list(p) for p in parent.paths]
+                replanned = self._plan_one(child_agent, new_cons[child_agent])
+                if replanned is None:
+                    continue
+                new_paths[child_agent] = replanned
+                cnew = self._soc(new_paths)
+                children.append(
+                    _CTNode(
+                        node_id=nid,
+                        parent_id=parent.node_id,
+                        depth=parent.depth + 1,
+                        cost=cnew,
+                        constraints=new_cons,
+                        paths=new_paths,
+                    )
+                )
+                nid += 1
+        elif conflict[0] == "edge":
+            (
+                _,
+                t,
+                pi0,
+                pi1,
+                ci0,
+                ci1,
+                pj0,
+                pj1,
+                cj0,
+                cj1,
+                ai,
+                aj,
+            ) = conflict
+            branches = [
+                (ai, ("e", t, pi0, pi1, ci0, ci1)),
+                (aj, ("e", t, pj0, pj1, cj0, cj1)),
+            ]
+            for child_agent, econ in branches:
+                new_cons = dict(parent.constraints)
+                new_cons[child_agent] = frozenset(new_cons[child_agent]) | {econ}
+                new_paths = [list(p) for p in parent.paths]
+                replanned = self._plan_one(child_agent, new_cons[child_agent])
+                if replanned is None:
+                    continue
+                new_paths[child_agent] = replanned
+                cnew = self._soc(new_paths)
+                children.append(
+                    _CTNode(
+                        node_id=nid,
+                        parent_id=parent.node_id,
+                        depth=parent.depth + 1,
+                        cost=cnew,
+                        constraints=new_cons,
+                        paths=new_paths,
+                    )
+                )
+                nid += 1
+        else:
+            raise ValueError(f"unknown conflict tag {conflict[0]!r}")
+        return children, nid
+
+    def _limited_cbs_from_node(
+        self,
+        entry: _CTNode,
+        *,
+        max_ct_pops: int,
+        deadline: Optional[float],
+        policy: ConflictPolicy,
+        rng: Optional[np.random.Generator],
+    ) -> Tuple[bool, int, Optional[int], bool]:
+        """
+        Continue CBS from a single CT node with pop and optional wall budget.
+
+        Returns (solved, pops_used, soc_if_solved, timed_out).
+        """
+        next_free = entry.node_id + 1
+        open_heap: List[Tuple[int, int, _CTNode]] = []
+        heap_counter = 0
+        heapq.heappush(open_heap, (entry.cost, heap_counter, entry))
+        heap_counter += 1
+        pops = 0
+        while open_heap:
+            if deadline is not None and time.monotonic() >= deadline:
+                return False, pops, None, True
+            if pops >= max_ct_pops:
+                return False, pops, None, False
+            _, _, node = heapq.heappop(open_heap)
+            pops += 1
+            conflicts = enumerate_conflicts(node.paths, self.goals)
+            if not conflicts:
+                return True, pops, self._soc(node.paths), False
+            conf = choose_conflict(conflicts, policy, rng)
+            new_children, next_free = self._branch_children(
+                node, conf, start_nid=next_free
+            )
+            for ch in new_children:
+                heapq.heappush(open_heap, (ch.cost, heap_counter, ch))
+                heap_counter += 1
+        return False, pops, None, False
+
+    def _rollout_labels_for_conflicts(
+        self,
+        parent: _CTNode,
+        conflicts: List[Tuple],
+    ) -> List[dict]:
+        rc = self.rollout_label_config
+        assert rc is not None
+        maxp = rc.max_ct_pops
+        labels: List[dict] = []
+        for c in conflicts:
+            children, _ = self._branch_children(parent, c, start_nid=1)
+            sides: List[dict] = []
+            for ch in children:
+                dl: Optional[float] = None
+                if rc.wall_time_s is not None:
+                    dl = time.monotonic() + float(rc.wall_time_s)
+                solved, pops, soc, timed_out = self._limited_cbs_from_node(
+                    ch,
+                    max_ct_pops=maxp,
+                    deadline=dl,
+                    policy=rc.policy,
+                    rng=None,
+                )
+                sides.append(
+                    {
+                        "solved": solved,
+                        "pops": int(pops),
+                        "soc": soc,
+                        "timed_out": timed_out,
+                    }
+                )
+            while len(sides) < 2:
+                sides.append(
+                    {
+                        "solved": False,
+                        "pops": maxp,
+                        "soc": None,
+                        "timed_out": False,
+                        "missing_child": True,
+                    }
+                )
+            a, b = sides[0], sides[1]
+            pa = int(a["pops"])
+            pb = int(b["pops"])
+            label_sum = pa + pb
+            if a["solved"] and b["solved"]:
+                label_min = min(pa, pb)
+            elif a["solved"]:
+                label_min = pa
+            elif b["solved"]:
+                label_min = pb
+            else:
+                label_min = None
+            labels.append(
+                {
+                    "conflict": conflict_to_dict(c),
+                    "side_a": a,
+                    "side_b": b,
+                    "label_sum_pops": label_sum,
+                    "label_min_pops": label_min,
+                    "max_ct_pops_budget": maxp,
+                }
+            )
+        return labels
+
+    def _emit_ct_expand(
+        self,
+        node: _CTNode,
+        conflicts: List[Tuple],
+        chosen: Tuple,
+        ct_pop_index: int,
+        rollout_labels: Optional[List[dict]] = None,
+    ) -> None:
+        if self.on_ct_expand is None:
+            return
+        payload: dict = {
+            **self.log_context,
+            "schema_version": "ct_expand/2" if rollout_labels else "ct_expand/1",
+            "event": "ct_expand",
+            "node_id": node.node_id,
+            "parent_id": node.parent_id,
+            "depth": node.depth,
+            "soc": node.cost,
+            "ct_pop_index": ct_pop_index,
+            "num_agents": self.N,
+            "conflict_policy": self.conflict_policy,
+            "conflicts": [conflict_to_dict(c) for c in conflicts],
+            "chosen": conflict_to_dict(chosen),
+            "constraint_counts": {str(i): len(node.constraints[i]) for i in range(self.N)},
+        }
+        if self.ct_log_features:
+            phi = compute_all_conflict_features(
+                conflicts,
+                node.paths,
+                self.goals,
+                self.grid,
+                node_soc=node.cost,
+                depth=node.depth,
+            )
+            payload["feature_names"] = list(FEATURE_NAMES)
+            payload["conflict_features"] = [row.tolist() for row in phi]
+        if rollout_labels is not None:
+            payload["rollout_labels"] = rollout_labels
+        self.on_ct_expand(payload)
+
     def solve(self) -> Optional[np.ndarray]:
         """
         Returns paths array (T, N, 2) or None if no solution within search limits.
+        After the call, see ``last_stats`` for CT expansions, timeouts, etc.
         """
+        empty_stats = CBSSolveStats(
+            success=False,
+            timed_out=False,
+            ct_nodes_popped=0,
+            ct_children_enqueued=0,
+            max_open_size=0,
+            sum_of_costs=None,
+        )
+
         root_paths = self._plan_all_independent()
         if root_paths is None:
+            self.last_stats = empty_stats
             return None
 
         root = _CTNode(
+            node_id=0,
+            parent_id=None,
+            depth=0,
             cost=self._soc(root_paths),
             constraints={i: frozenset() for i in range(self.N)},
             paths=[list(p) for p in root_paths],
         )
+        next_node_id = 1
 
         open_heap: List[Tuple[int, int, _CTNode]] = []
         heap_counter = 0
+        ct_nodes_popped = 0
+        ct_children_enqueued = 0
+        max_open_size = 0
+        deadline: Optional[float] = None
+        if self.wall_time_limit_s is not None:
+            deadline = time.monotonic() + float(self.wall_time_limit_s)
 
         def push(node: _CTNode) -> None:
-            nonlocal heap_counter
+            nonlocal heap_counter, max_open_size
             heapq.heappush(open_heap, (node.cost, heap_counter, node))
             heap_counter += 1
+            max_open_size = max(max_open_size, len(open_heap))
 
         push(root)
 
         while open_heap:
-            _, _, node = heapq.heappop(open_heap)
+            if deadline is not None and time.monotonic() >= deadline:
+                self.last_stats = CBSSolveStats(
+                    success=False,
+                    timed_out=True,
+                    ct_nodes_popped=ct_nodes_popped,
+                    ct_children_enqueued=ct_children_enqueued,
+                    max_open_size=max_open_size,
+                    sum_of_costs=None,
+                )
+                return None
 
-            conf = _find_conflict(node.paths, self.goals)
-            if conf is None:
+            _, _, node = heapq.heappop(open_heap)
+            ct_nodes_popped += 1
+
+            conflicts = enumerate_conflicts(node.paths, self.goals)
+            if not conflicts:
+                soc = self._soc(node.paths)
+                self.last_stats = CBSSolveStats(
+                    success=True,
+                    timed_out=False,
+                    ct_nodes_popped=ct_nodes_popped,
+                    ct_children_enqueued=ct_children_enqueued,
+                    max_open_size=max_open_size,
+                    sum_of_costs=soc,
+                )
                 return _pad_paths_to_array(node.paths, self.goals)
 
-            if conf[0] == "vertex":
-                _, t, r, c, ai, aj = conf
-                for child_agent, _other in ((ai, aj), (aj, ai)):
-                    vcon: Constraint = ("v", t, r, c)
-                    new_cons = dict(node.constraints)
-                    new_cons[child_agent] = frozenset(new_cons[child_agent]) | {vcon}
-                    new_paths = [list(p) for p in node.paths]
-                    replanned = self._plan_one(child_agent, new_cons[child_agent])
-                    if replanned is None:
-                        continue
-                    new_paths[child_agent] = replanned
-                    cnew = self._soc(new_paths)
-                    push(_CTNode(cost=cnew, constraints=new_cons, paths=new_paths))
-            else:
-                (
-                    _,
-                    t,
-                    pi0,
-                    pi1,
-                    ci0,
-                    ci1,
-                    pj0,
-                    pj1,
-                    cj0,
-                    cj1,
-                    ai,
-                    aj,
-                ) = conf
-                branches = [
-                    (ai, ("e", t, pi0, pi1, ci0, ci1)),
-                    (aj, ("e", t, pj0, pj1, cj0, cj1)),
-                ]
-                for child_agent, econ in branches:
-                    new_cons = dict(node.constraints)
-                    new_cons[child_agent] = frozenset(new_cons[child_agent]) | {econ}
-                    new_paths = [list(p) for p in node.paths]
-                    replanned = self._plan_one(child_agent, new_cons[child_agent])
-                    if replanned is None:
-                        continue
-                    new_paths[child_agent] = replanned
-                    cnew = self._soc(new_paths)
-                    push(_CTNode(cost=cnew, constraints=new_cons, paths=new_paths))
+            conf = choose_conflict(conflicts, self.conflict_policy, self.rng)
+            rollout_labels: Optional[List[dict]] = None
+            if (
+                self.rollout_label_config is not None
+                and self.on_ct_expand is not None
+            ):
+                rollout_labels = self._rollout_labels_for_conflicts(node, conflicts)
+            self._emit_ct_expand(
+                node,
+                conflicts,
+                conf,
+                ct_nodes_popped,
+                rollout_labels=rollout_labels,
+            )
 
+            new_children, next_node_id = self._branch_children(
+                node, conf, start_nid=next_node_id
+            )
+            for ch in new_children:
+                push(ch)
+                ct_children_enqueued += 1
+
+        self.last_stats = CBSSolveStats(
+            success=False,
+            timed_out=False,
+            ct_nodes_popped=ct_nodes_popped,
+            ct_children_enqueued=ct_children_enqueued,
+            max_open_size=max_open_size,
+            sum_of_costs=None,
+        )
         return None

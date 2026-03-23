@@ -1,0 +1,20 @@
+{
+  "success": true,
+  "timed_out": false,
+  "ct_nodes_popped": 2,
+  "ct_children_enqueued": 2,
+  "max_open_size": 2,
+  "sum_of_costs": 65,
+  "wall_clock_s": 0.003269916051067412,
+  "map": "data/mapf-map/empty-32-32.map",
+  "scen": "data/scens/empty-32-32-random-24.scen",
+  "k": 5,
+  "max_time_horizon": 128,
+  "conflict_policy": "earliest",
+  "seed": null,
+  "log_ct": "data/ct_run.jsonl",
+  "log_ct_features": true,
+  "rollout_max_pops": 500,
+  "rollout_wall_s": null,
+  "rollout_policy": "earliest"
+}
