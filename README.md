@@ -110,6 +110,46 @@ python -m scripts.run_cbs --map random-32-32-10 --k 10 --out paths.npy \
 - **`cbs_stats.json`** (from `--stats_json`): Run-level metrics—wall time, success or timeout, conflict-tree nodes popped, children enqueued, max open-list size, sum of costs, plus the map/scenario paths and planner options used for that run.
 - **`ct_run.jsonl`** (from `--log_ct`): One JSON object per line, each describing a conflict-tree expansion (instrumentation for analysis or learning). Optional `--log_ct_features` adds per-conflict feature vectors; rollout labeling flags (`--rollout_max_pops`, etc.) attach extra fields when enabled—see `python -m scripts.run_cbs --help`.
 
+#### Learned conflict selection pipeline
+
+The repo now supports a full `collect -> train -> run learned CBS` loop for **vanilla optimal CBS conflict selection**.
+
+1. Collect rollout-labeled CT logs:
+
+```bash
+python -m scripts.collect_cbs_dataset --map random-32-32-10 --k 10 \
+  --train_instances 20 --val_instances 5 --test_instances 5 \
+  --out_dir data/cbs_learning --rollout_max_pops 500
+```
+
+2. Train a small linear ranker:
+
+```bash
+python -m scripts.train_conflict_ranker \
+  --train_jsonl data/cbs_learning/train.jsonl \
+  --val_jsonl data/cbs_learning/val.jsonl \
+  --test_jsonl data/cbs_learning/test.jsonl \
+  --model_out models/conflict_ranker.npz \
+  --summary_json models/conflict_ranker_summary.json
+```
+
+3. Run CBS with the learned conflict selector:
+
+```bash
+python -m scripts.run_cbs --map random-32-32-10 --k 10 --out paths.npy \
+  --conflict_policy learned --model_path models/conflict_ranker.npz --validate
+```
+
+If the learned model is unavailable, invalid, or cannot score a node, the solver falls back to `earliest`.
+
+#### Learning targets and features
+
+- **Primary supervision**: `E_sum(c) = e_left + e_right`, where each child effort is the bounded high-level pop count from rollout labeling.
+- **Secondary ablation target**: `E_min(c)`, the minimum solved-side effort when at least one child solves within budget.
+- **Censoring rule**: if a child rollout times out or does not solve within the pop budget `B`, its effort is recorded as `B`.
+- **Feature names** (in `ct_run.jsonl` and exported models): `is_vertex`, `is_edge`, `t_norm`, `agent_i_norm`, `agent_j_norm`, `goal_sep_norm`, `cost_i_norm`, `cost_j_norm`, `pair_cost_share`, `inv_num_conflicts`, `depth_norm`, `soc_norm`, `free_neighbor_norm`.
+- **Training objective**: pairwise ranking with L2-regularized hinge loss on conflicts from the same CT node. The exported runtime model stores `feature_names`, `mean`, `scale`, `weights`, and `bias` in `.npz`.
+
 ### Validate Paths
 
 Validate a solution path file:

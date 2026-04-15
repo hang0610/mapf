@@ -139,7 +139,8 @@ def compute_conflict_features(
     feat[8] = (ci + cj) / float(sum_sc)
     feat[9] = 1.0 / float(1 + max(num_conflicts, 0))
     feat[10] = float(depth) / float(depth + 10)
-    feat[11] = float(node_soc) / float(max(node_soc, 1))
+    # Average agent cost relative to the longest current path cost.
+    feat[11] = float(node_soc) / float(max(N * max_sc, 1))
     feat[12] = _free_neighbor_frac(grid, fr, fc)
     return feat
 

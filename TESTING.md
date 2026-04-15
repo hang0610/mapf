@@ -1,6 +1,6 @@
 # Testing Guide
 
-This directory contains comprehensive test files and scripts for `sample_instance.py` and `validate_paths.py`.
+This directory contains comprehensive test files and scripts for the core MAPF utilities, plus smoke tests for learned CBS conflict selection.
 
 ## Test Files
 
@@ -13,6 +13,10 @@ This directory contains comprehensive test files and scripts for `sample_instanc
 2. **`tests/test_validate_paths.py`** - Comprehensive Python tests for `validate_paths.py`
    - Tests validation, error handling, different connectivity, edge cases
    - Run with: `python tests/test_validate_paths.py`
+
+3. **`tests/test_cbs_learning.py`** - Smoke tests for learned CBS conflict selection
+   - Tests rollout-label supervision, model save/load, and an end-to-end `collect -> train -> run_cbs --conflict_policy learned` loop
+   - Run with: `python tests/test_cbs_learning.py`
 
 ### Shell Script Test Files
 
@@ -98,6 +102,12 @@ python tests/test_validate_paths.py
 - ✅ Different maps
 - ✅ Offset parameter
 
+### Learned CBS Tests
+
+- ✅ Rollout-label to effort-target conversion (`E_sum`, `E_min`, censoring)
+- ✅ Linear ranker export/import consistency
+- ✅ End-to-end dataset collection, training, and learned-policy CBS smoke test
+
 ## Expected Output
 
 All tests should complete successfully. If a test fails:
@@ -123,4 +133,3 @@ To add new tests:
 1. **For shell scripts**: Add test cases to the appropriate `.sh` file
 2. **For Python tests**: Add test functions to `tests/test_*.py` files
 3. Follow the existing test patterns and naming conventions
-

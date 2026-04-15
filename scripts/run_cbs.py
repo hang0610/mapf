@@ -18,6 +18,7 @@ from mapf_env.io.movingai_scene import load_scen
 from core.instance import instance_from_scen
 from core.validate import validate_paths
 from planners.cbs import CBSSolver, ConflictPolicy, RolloutLabelConfig
+from planners.conflict_ranker import LinearConflictRanker
 
 
 def default_scen_path(map_name: str, scen_dir: str) -> Path:
@@ -106,9 +107,18 @@ def main() -> None:
     parser.add_argument(
         "--conflict_policy",
         type=str,
-        choices=("earliest", "random"),
+        choices=("earliest", "random", "learned"),
         default="earliest",
-        help="How to pick a conflict when |C(n)|>1: earliest in time/agent order, or uniform random.",
+        help=(
+            "How to pick a conflict when |C(n)|>1: earliest in time/agent order, "
+            "uniform random, or a learned linear ranker."
+        ),
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=None,
+        help="Path to a learned conflict-ranker .npz model (used by --conflict_policy learned).",
     )
     parser.add_argument(
         "--seed",
@@ -184,9 +194,33 @@ def main() -> None:
     )
 
     policy = cast(ConflictPolicy, args.conflict_policy)
+    effective_policy = policy
     rng = None
     if policy == "random":
         rng = np.random.default_rng(args.seed)
+
+    learned_ranker: Optional[LinearConflictRanker] = None
+    resolved_model_path: Optional[Path] = None
+    if policy == "learned":
+        if args.model_path is None:
+            print(
+                "[WARN] --conflict_policy learned requested without --model_path; "
+                "falling back to earliest.",
+                file=sys.stderr,
+            )
+            effective_policy = cast(ConflictPolicy, "earliest")
+        else:
+            resolved_model_path = Path(args.model_path).expanduser().resolve()
+            try:
+                learned_ranker = LinearConflictRanker.load_npz(resolved_model_path)
+            except Exception as exc:
+                print(
+                    f"[WARN] failed to load learned model from {resolved_model_path}: {exc}; "
+                    "falling back to earliest.",
+                    file=sys.stderr,
+                )
+                effective_policy = cast(ConflictPolicy, "earliest")
+                learned_ranker = None
 
     if args.rollout_max_pops is not None and not args.log_ct:
         print(
@@ -228,12 +262,13 @@ def main() -> None:
             goals=instance.goals,
             max_time=args.max_time,
             wall_time_limit_s=args.timeout,
-            conflict_policy=policy,
+            conflict_policy=effective_policy,
             rng=rng,
             on_ct_expand=on_ct_expand if log_fp is not None else None,
             ct_log_features=bool(log_fp is not None and args.log_ct_features),
             log_context=log_context,
             rollout_label_config=rollout_cfg,
+            learned_ranker=learned_ranker,
         )
         paths = solver.solve()
         elapsed = time.perf_counter() - t0
@@ -251,6 +286,15 @@ def main() -> None:
             f"ct_pops={stats.ct_nodes_popped} ct_children={stats.ct_children_enqueued} "
             f"max_open={stats.max_open_size} soc={stats.sum_of_costs} wall_s={elapsed:.6f}"
         )
+        if stats.learned_policy_calls > 0:
+            avg_ms = 1000.0 * stats.learned_policy_wall_s / max(stats.learned_policy_calls, 1)
+            print(
+                "Learned conflict selector: "
+                f"calls={stats.learned_policy_calls} "
+                f"fallbacks={stats.learned_policy_fallbacks} "
+                f"score_wall_s={stats.learned_policy_wall_s:.6f} "
+                f"score_avg_ms={avg_ms:.3f}"
+            )
 
     if paths is None:
         _print_stats_line()
@@ -270,12 +314,19 @@ def main() -> None:
                 "k": args.k,
                 "max_time_horizon": args.max_time,
                 "conflict_policy": args.conflict_policy,
+                "effective_conflict_policy": effective_policy,
                 "seed": args.seed,
+                "model_path": str(resolved_model_path) if resolved_model_path else None,
                 "log_ct": args.log_ct,
                 "log_ct_features": args.log_ct_features,
                 "rollout_max_pops": args.rollout_max_pops,
                 "rollout_wall_s": args.rollout_wall_s,
                 "rollout_policy": args.rollout_policy,
+                "learned_policy_avg_ms": (
+                    1000.0 * stats.learned_policy_wall_s / max(stats.learned_policy_calls, 1)
+                    if stats.learned_policy_calls > 0
+                    else None
+                ),
             }
             p = Path(args.stats_json).expanduser().resolve()
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -302,12 +353,19 @@ def main() -> None:
             "k": args.k,
             "max_time_horizon": args.max_time,
             "conflict_policy": args.conflict_policy,
+            "effective_conflict_policy": effective_policy,
             "seed": args.seed,
+            "model_path": str(resolved_model_path) if resolved_model_path else None,
             "log_ct": args.log_ct,
             "log_ct_features": args.log_ct_features,
             "rollout_max_pops": args.rollout_max_pops,
             "rollout_wall_s": args.rollout_wall_s,
             "rollout_policy": args.rollout_policy,
+            "learned_policy_avg_ms": (
+                1000.0 * stats.learned_policy_wall_s / max(stats.learned_policy_calls, 1)
+                if stats.learned_policy_calls > 0
+                else None
+            ),
         }
         p = Path(args.stats_json).expanduser().resolve()
         p.parent.mkdir(parents=True, exist_ok=True)

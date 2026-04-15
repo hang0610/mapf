@@ -15,8 +15,9 @@ from planners.conflict_features import (
     compute_all_conflict_features,
     conflict_to_dict,
 )
+from planners.conflict_ranker import LinearConflictRanker
 
-ConflictPolicy = Literal["earliest", "random"]
+ConflictPolicy = Literal["earliest", "random", "learned"]
 
 # Constraint tuples (per agent):
 # Vertex: ("v", t, r, c) — cannot occupy (r, c) at time t
@@ -228,6 +229,8 @@ def choose_conflict(
     conflicts: List[Tuple],
     policy: ConflictPolicy,
     rng: Optional[np.random.Generator],
+    *,
+    scores: Optional[np.ndarray] = None,
 ) -> Tuple:
     if not conflicts:
         raise ValueError("choose_conflict: empty conflict list")
@@ -236,6 +239,12 @@ def choose_conflict(
     if policy == "random":
         r = rng if rng is not None else np.random.default_rng()
         return conflicts[int(r.integers(0, len(conflicts)))]
+    if policy == "learned":
+        if scores is None:
+            raise ValueError("choose_conflict: learned policy requires scores")
+        if len(scores) != len(conflicts):
+            raise ValueError("choose_conflict: scores length mismatch")
+        return conflicts[int(np.argmin(np.asarray(scores, dtype=np.float64)))]
     raise ValueError(f"unknown conflict policy {policy!r}")
 
 
@@ -289,6 +298,9 @@ class CBSSolveStats:
     ct_children_enqueued: int
     max_open_size: int
     sum_of_costs: Optional[int]
+    learned_policy_calls: int = 0
+    learned_policy_fallbacks: int = 0
+    learned_policy_wall_s: float = 0.0
 
 
 class CBSSolver:
@@ -310,6 +322,7 @@ class CBSSolver:
         ct_log_features: bool = False,
         log_context: Optional[Dict[str, Any]] = None,
         rollout_label_config: Optional[RolloutLabelConfig] = None,
+        learned_ranker: Optional[LinearConflictRanker] = None,
     ):
         self.grid = grid
         self.starts = starts.astype(int)
@@ -324,6 +337,10 @@ class CBSSolver:
         self.ct_log_features = ct_log_features
         self.log_context = dict(log_context) if log_context else {}
         self.rollout_label_config = rollout_label_config
+        self.learned_ranker = learned_ranker
+        self._learned_policy_calls = 0
+        self._learned_policy_fallbacks = 0
+        self._learned_policy_wall_s = 0.0
 
     def _plan_one(
         self,
@@ -353,6 +370,50 @@ class CBSSolver:
             g = (int(self.goals[i, 0]), int(self.goals[i, 1]))
             total += _path_cost(paths[i], g)
         return total
+
+    def _compute_conflict_features(
+        self,
+        node: _CTNode,
+        conflicts: List[Tuple],
+    ) -> np.ndarray:
+        return compute_all_conflict_features(
+            conflicts,
+            node.paths,
+            self.goals,
+            self.grid,
+            node_soc=node.cost,
+            depth=node.depth,
+        )
+
+    def _choose_conflict(
+        self,
+        node: _CTNode,
+        conflicts: List[Tuple],
+        conflict_features: Optional[np.ndarray] = None,
+    ) -> Tuple[Tuple, Optional[np.ndarray]]:
+        if self.conflict_policy != "learned":
+            return choose_conflict(conflicts, self.conflict_policy, self.rng), conflict_features
+
+        self._learned_policy_calls += 1
+        if len(conflicts) <= 1 or self.learned_ranker is None:
+            self._learned_policy_fallbacks += 1
+            return conflicts[0], conflict_features
+
+        t0 = time.perf_counter()
+        try:
+            phi = conflict_features
+            if phi is None:
+                phi = self._compute_conflict_features(node, conflicts)
+            scores = self.learned_ranker.score_features(phi, FEATURE_NAMES)
+            if not np.all(np.isfinite(scores)):
+                raise ValueError("non-finite learned conflict scores")
+            chosen = choose_conflict(conflicts, "learned", self.rng, scores=scores)
+            return chosen, phi
+        except Exception:
+            self._learned_policy_fallbacks += 1
+            return conflicts[0], conflict_features
+        finally:
+            self._learned_policy_wall_s += time.perf_counter() - t0
 
     def _branch_children(
         self,
@@ -541,6 +602,7 @@ class CBSSolver:
         chosen: Tuple,
         ct_pop_index: int,
         rollout_labels: Optional[List[dict]] = None,
+        conflict_features: Optional[np.ndarray] = None,
     ) -> None:
         if self.on_ct_expand is None:
             return
@@ -560,14 +622,9 @@ class CBSSolver:
             "constraint_counts": {str(i): len(node.constraints[i]) for i in range(self.N)},
         }
         if self.ct_log_features:
-            phi = compute_all_conflict_features(
-                conflicts,
-                node.paths,
-                self.goals,
-                self.grid,
-                node_soc=node.cost,
-                depth=node.depth,
-            )
+            phi = conflict_features
+            if phi is None:
+                phi = self._compute_conflict_features(node, conflicts)
             payload["feature_names"] = list(FEATURE_NAMES)
             payload["conflict_features"] = [row.tolist() for row in phi]
         if rollout_labels is not None:
@@ -586,6 +643,9 @@ class CBSSolver:
             ct_children_enqueued=0,
             max_open_size=0,
             sum_of_costs=None,
+            learned_policy_calls=self._learned_policy_calls,
+            learned_policy_fallbacks=self._learned_policy_fallbacks,
+            learned_policy_wall_s=self._learned_policy_wall_s,
         )
 
         root_paths = self._plan_all_independent()
@@ -629,6 +689,9 @@ class CBSSolver:
                     ct_children_enqueued=ct_children_enqueued,
                     max_open_size=max_open_size,
                     sum_of_costs=None,
+                    learned_policy_calls=self._learned_policy_calls,
+                    learned_policy_fallbacks=self._learned_policy_fallbacks,
+                    learned_policy_wall_s=self._learned_policy_wall_s,
                 )
                 return None
 
@@ -645,10 +708,20 @@ class CBSSolver:
                     ct_children_enqueued=ct_children_enqueued,
                     max_open_size=max_open_size,
                     sum_of_costs=soc,
+                    learned_policy_calls=self._learned_policy_calls,
+                    learned_policy_fallbacks=self._learned_policy_fallbacks,
+                    learned_policy_wall_s=self._learned_policy_wall_s,
                 )
                 return _pad_paths_to_array(node.paths, self.goals)
 
-            conf = choose_conflict(conflicts, self.conflict_policy, self.rng)
+            conflict_features: Optional[np.ndarray] = None
+            if self.ct_log_features:
+                conflict_features = self._compute_conflict_features(node, conflicts)
+            conf, conflict_features = self._choose_conflict(
+                node,
+                conflicts,
+                conflict_features=conflict_features,
+            )
             rollout_labels: Optional[List[dict]] = None
             if (
                 self.rollout_label_config is not None
@@ -661,6 +734,7 @@ class CBSSolver:
                 conf,
                 ct_nodes_popped,
                 rollout_labels=rollout_labels,
+                conflict_features=conflict_features,
             )
 
             new_children, next_node_id = self._branch_children(
@@ -677,5 +751,8 @@ class CBSSolver:
             ct_children_enqueued=ct_children_enqueued,
             max_open_size=max_open_size,
             sum_of_costs=None,
+            learned_policy_calls=self._learned_policy_calls,
+            learned_policy_fallbacks=self._learned_policy_fallbacks,
+            learned_policy_wall_s=self._learned_policy_wall_s,
         )
         return None
