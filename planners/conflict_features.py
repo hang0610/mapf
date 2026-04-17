@@ -126,6 +126,8 @@ def compute_conflict_features(
     goal_sep = abs(g0[0] - g1[0]) + abs(g0[1] - g1[1])
 
     ci, cj = costs[ai], costs[aj]
+    cost_lo = min(ci, cj)
+    cost_hi = max(ci, cj)
     feat = np.zeros(_FEATURE_DIM, dtype=np.float64)
     feat[0] = is_v
     feat[1] = is_e
@@ -134,8 +136,8 @@ def compute_conflict_features(
     feat[3] = min(ai, aj) / denom_ag
     feat[4] = max(ai, aj) / denom_ag
     feat[5] = goal_sep / float(diag)
-    feat[6] = ci / float(max_sc)
-    feat[7] = cj / float(max_sc)
+    feat[6] = cost_lo / float(max_sc)
+    feat[7] = cost_hi / float(max_sc)
     feat[8] = (ci + cj) / float(sum_sc)
     feat[9] = 1.0 / float(1 + max(num_conflicts, 0))
     feat[10] = float(depth) / float(depth + 10)

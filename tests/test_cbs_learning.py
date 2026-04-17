@@ -136,6 +136,45 @@ class TestCBSLearning(unittest.TestCase):
                 loaded.score_features(feats, tuple(f"f{i}" for i in range(feats.shape[1]))),
             )
 
+    def test_runtime_scoring_is_symmetric_in_cost_pair(self) -> None:
+        feature_names = (
+            "is_vertex",
+            "is_edge",
+            "t_norm",
+            "agent_i_norm",
+            "agent_j_norm",
+            "goal_sep_norm",
+            "cost_i_norm",
+            "cost_j_norm",
+            "pair_cost_share",
+            "inv_num_conflicts",
+            "depth_norm",
+            "soc_norm",
+            "free_neighbor_norm",
+        )
+        ranker = MLPConflictRanker(
+            feature_names=feature_names,
+            mean=np.zeros((len(feature_names),), dtype=np.float64),
+            scale=np.ones((len(feature_names),), dtype=np.float64),
+            w1=np.ones((len(feature_names), 2), dtype=np.float64),
+            b1=np.zeros((2,), dtype=np.float64),
+            w2=np.ones((2, 2), dtype=np.float64),
+            b2=np.zeros((2,), dtype=np.float64),
+            w3=np.ones((2, 1), dtype=np.float64),
+            b3=np.zeros((1,), dtype=np.float64),
+        )
+        base = np.asarray(
+            [[0.0, 1.0, 0.4, 0.2, 0.8, 0.3, 0.9, 0.2, 0.4, 0.5, 0.1, 0.6, 0.7]],
+            dtype=np.float64,
+        )
+        swapped = base.copy()
+        swapped[0, 6] = base[0, 7]
+        swapped[0, 7] = base[0, 6]
+        np.testing.assert_allclose(
+            ranker.score_features(base, feature_names),
+            ranker.score_features(swapped, feature_names),
+        )
+
     def test_end_to_end_collect_train_and_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)

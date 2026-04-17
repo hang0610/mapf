@@ -7,6 +7,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+_MINMAX_FEATURE_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("cost_i_norm", "cost_j_norm"),
+)
+
 
 @dataclass
 class NodeRankingExample:
@@ -57,7 +61,7 @@ class MLPConflictRanker:
         features: np.ndarray,
         feature_names: Sequence[str],
     ) -> np.ndarray:
-        x = np.asarray(features, dtype=np.float64)
+        x = _canonicalize_feature_matrix(np.asarray(features, dtype=np.float64), feature_names)
         if x.ndim != 2:
             raise ValueError(f"features must be 2D, got shape {x.shape}")
         idx = _feature_indices(feature_names, self.feature_names)
@@ -472,7 +476,10 @@ def _row_to_example(
     if not feature_names or feature_rows is None or rollout_labels is None:
         return None
 
-    features = np.asarray(feature_rows, dtype=np.float64)
+    features = _canonicalize_feature_matrix(
+        np.asarray(feature_rows, dtype=np.float64),
+        feature_names,
+    )
     if features.ndim != 2 or features.shape[0] != len(rollout_labels):
         return None
 
@@ -511,6 +518,26 @@ def _feature_indices(
             raise ValueError(f"missing feature {name!r} in runtime feature matrix")
         idx.append(raw_idx[name])
     return idx
+
+
+def _canonicalize_feature_matrix(
+    features: np.ndarray,
+    feature_names: Sequence[str],
+) -> np.ndarray:
+    if features.ndim != 2:
+        return features
+    out = np.asarray(features, dtype=np.float64).copy()
+    raw_idx = {name: i for i, name in enumerate(feature_names)}
+    for left_name, right_name in _MINMAX_FEATURE_PAIRS:
+        if left_name not in raw_idx or right_name not in raw_idx:
+            continue
+        left = raw_idx[left_name]
+        right = raw_idx[right_name]
+        lo = np.minimum(out[:, left], out[:, right])
+        hi = np.maximum(out[:, left], out[:, right])
+        out[:, left] = lo
+        out[:, right] = hi
+    return out
 
 
 def _init_mlp_params(
