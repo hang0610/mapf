@@ -18,11 +18,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from planners.conflict_ranker import (  # noqa: E402
+    compute_pairwise_loss,
+    evaluate_ranker,
     MLPConflictRanker,
     NodeRankingExample,
     fit_mlp_ranker,
     summarize_rollout_label,
 )
+from scripts.playback_paths import scenario_instance  # noqa: E402
 
 
 def _write_toy_map_and_scen(tmpdir: Path) -> tuple[Path, Path]:
@@ -105,6 +108,12 @@ class TestCBSLearning(unittest.TestCase):
         )
         self.assertIsNotNone(summary["pairwise_accuracy"])
         self.assertGreater(summary["pairwise_accuracy"], 0.8)
+        eval_summary = evaluate_ranker(ranker, examples, delta=0.5)
+        self.assertIsNotNone(eval_summary["pairwise_loss"])
+        self.assertAlmostEqual(
+            float(eval_summary["pairwise_loss"]),
+            float(compute_pairwise_loss(ranker, examples, delta=0.5)),
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             model_path = Path(tmp) / "ranker.npz"
@@ -254,6 +263,216 @@ class TestCBSLearning(unittest.TestCase):
             stats = json.loads(learned_stats.read_text(encoding="utf-8"))
             self.assertEqual(stats["effective_conflict_policy"], "learned")
             self.assertGreaterEqual(stats["learned_policy_calls"], 1)
+
+    def test_playback_instance_matches_run_cbs_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            map_path = tmpdir / "toy.map"
+            scen_path = tmpdir / "toy.scen"
+            map_path.write_text("type octile\nheight 3\nwidth 3\nmap\n...\n.@.\n...\n", encoding="utf-8")
+            with scen_path.open("w", encoding="utf-8") as fh:
+                fh.write("version 1\n")
+                fh.write("0\ttoy.map\t3\t3\t1\t1\t0\t0\t1\n")  # invalid, on obstacle
+                fh.write("0\ttoy.map\t3\t3\t0\t0\t2\t2\t1\n")
+                fh.write("0\ttoy.map\t3\t3\t0\t2\t2\t0\t1\n")
+                fh.write("0\ttoy.map\t3\t3\t2\t0\t0\t2\t1\n")
+                fh.write("0\ttoy.map\t3\t3\t2\t2\t0\t0\t1\n")
+
+            grid = np.asarray(
+                [
+                    [0, 0, 0],
+                    [0, 1, 0],
+                    [0, 0, 0],
+                ],
+                dtype=np.int64,
+            )
+            scen_starts = np.asarray(
+                [[1, 1], [0, 0], [2, 0], [0, 2], [2, 2]],
+                dtype=np.int64,
+            )
+            scen_goals = np.asarray(
+                [[0, 0], [2, 2], [0, 2], [2, 0], [0, 0]],
+                dtype=np.int64,
+            )
+
+            instance = scenario_instance(
+                grid,
+                scen_starts,
+                scen_goals,
+                k=2,
+                offset=1,
+                filter_invalid_rows=False,
+            )
+            np.testing.assert_array_equal(instance.starts, scen_starts[1:3])
+            np.testing.assert_array_equal(instance.goals, scen_goals[1:3])
+
+            filtered = scenario_instance(
+                grid,
+                scen_starts,
+                scen_goals,
+                k=2,
+                offset=1,
+                filter_invalid_rows=True,
+            )
+            self.assertFalse(np.array_equal(filtered.starts, instance.starts))
+
+            paths_path = tmpdir / "paths.npy"
+            gif_path = tmpdir / "demo.gif"
+            np.save(
+                paths_path,
+                np.asarray(
+                    [
+                        instance.starts,
+                        instance.goals,
+                    ],
+                    dtype=np.int64,
+                ),
+            )
+
+            playback_cmd = [
+                sys.executable,
+                "-m",
+                "scripts.playback_paths",
+                "--map",
+                "toy",
+                "--map_path",
+                str(map_path),
+                "--scen_path",
+                str(scen_path),
+                "--k",
+                "2",
+                "--offset",
+                "1",
+                "--paths",
+                str(paths_path),
+                "--out",
+                str(gif_path),
+                "--fps",
+                "2",
+            ]
+            res = subprocess.run(
+                playback_cmd,
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr or res.stdout)
+            self.assertTrue(gif_path.exists())
+            self.assertNotIn("[WARN] paths has N=", res.stdout)
+
+    def test_eval_conflict_policies_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            map_path, scen_path = _write_toy_map_and_scen(tmpdir)
+            data_dir = tmpdir / "dataset"
+            model_path = tmpdir / "ranker.npz"
+            summary_path = tmpdir / "train_summary.json"
+            eval_dir = tmpdir / "eval"
+
+            collect_cmd = [
+                sys.executable,
+                "-m",
+                "scripts.collect_cbs_dataset",
+                "--map",
+                "toy",
+                "--map_path",
+                str(map_path),
+                "--scen_path",
+                str(scen_path),
+                "--k",
+                "3",
+                "--offset_step",
+                "3",
+                "--train_instances",
+                "2",
+                "--val_instances",
+                "1",
+                "--out_dir",
+                str(data_dir),
+                "--rollout_max_pops",
+                "12",
+                "--max_time",
+                "32",
+            ]
+            res = subprocess.run(
+                collect_cmd,
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr or res.stdout)
+
+            train_cmd = [
+                sys.executable,
+                "-m",
+                "scripts.train_conflict_ranker",
+                "--train_jsonl",
+                str(data_dir / "train.jsonl"),
+                "--val_jsonl",
+                str(data_dir / "val.jsonl"),
+                "--model_out",
+                str(model_path),
+                "--summary_json",
+                str(summary_path),
+            ]
+            res = subprocess.run(
+                train_cmd,
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr or res.stdout)
+
+            eval_cmd = [
+                sys.executable,
+                "-m",
+                "scripts.eval_conflict_policies",
+                "--map",
+                "toy",
+                "--map_path",
+                str(map_path),
+                "--scen_path",
+                str(scen_path),
+                "--k",
+                "3",
+                "--offset_start",
+                "6",
+                "--offset_step",
+                "3",
+                "--num_instances",
+                "1",
+                "--policies",
+                "earliest",
+                "learned",
+                "--model_path",
+                str(model_path),
+                "--out_dir",
+                str(eval_dir),
+                "--max_time",
+                "32",
+                "--make_gif_for_offsets",
+                "6",
+            ]
+            res = subprocess.run(
+                eval_cmd,
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr or res.stdout)
+
+            summary_rows = [
+                json.loads(line)
+                for line in (eval_dir / "summary.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual({row["policy"] for row in summary_rows}, {"earliest", "learned"})
+            learned_rows = [row for row in summary_rows if row["policy"] == "learned"]
+            self.assertEqual(learned_rows[0]["effective_conflict_policy"], "learned")
+            self.assertIsNotNone(learned_rows[0]["stats_path"])
+            self.assertTrue(Path(learned_rows[0]["stats_path"]).exists())
+            self.assertTrue((eval_dir / "earliest" / "offset_000006.gif").exists())
+            self.assertTrue((eval_dir / "learned" / "offset_000006.gif").exists())
 
 
 if __name__ == "__main__":

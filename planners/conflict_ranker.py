@@ -376,7 +376,8 @@ def fit_mlp_ranker(
         "skipped_ties": train_pairs.skipped_ties,
         "best_epoch": best_epoch,
         "epochs_ran": min(max(int(epochs), 1), best_epoch + no_improve),
-        "pairwise_loss": best_train_loss,
+        "pairwise_loss": metrics["pairwise_loss"],
+        "train_objective": best_train_loss,
         "val_pairwise_loss": best_val_loss,
     }
     return ranker, summary
@@ -392,8 +393,7 @@ def evaluate_ranker(
     weighted_total = 0.0
     top1_correct = 0
     top1_total = 0
-    standardized_examples = standardize_examples(examples, ranker.mean, ranker.scale)
-    pairwise_loss = compute_pairwise_loss(ranker, standardized_examples, delta=delta)
+    pairwise_loss = compute_pairwise_loss(ranker, examples, delta=delta)
 
     for ex in examples:
         if ex.features.shape[0] == 0:

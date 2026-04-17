@@ -142,6 +142,26 @@ python -m scripts.run_cbs --map random-32-32-10 --k 10 --out paths.npy \
 
 If the learned model is unavailable, invalid, or cannot score a node, the solver falls back to `earliest`.
 
+#### Full held-out comparison: `earliest` vs `learned`
+
+Once you have a trained model, you can batch-evaluate held-out instances and optionally save paired GIFs for a few offsets:
+
+```bash
+python -m scripts.eval_conflict_policies \
+  --map random-32-32-10 \
+  --k 10 \
+  --offset_start 250 \
+  --offset_step 10 \
+  --num_instances 20 \
+  --policies earliest learned \
+  --model_path models/conflict_ranker.npz \
+  --out_dir results/random-32-32-10_eval \
+  --max_time 128 \
+  --make_gif_for_offsets 250 300
+```
+
+This writes per-instance `paths.npy` and `stats.json` files under `results/random-32-32-10_eval/<policy>/`, plus top-level `summary.jsonl` and `summary.csv` tables for quick baseline-vs-learned comparisons.
+
 #### Learning targets and features
 
 - **Primary supervision**: `E_sum(c) = e_left + e_right`, where each child effort is the bounded high-level pop count from rollout labeling.
@@ -174,6 +194,30 @@ Create an animated GIF from a path solution:
 ```bash
 python -m scripts.playback_paths --map empty-32-32 --paths paths.npy --k 10 --out demo.gif --fps 6
 ```
+
+`playback_paths` also accepts `--map_path` and `--scen_path`, so you can visualize runs that use explicit files instead of the default `data/mapf-map/` and `data/scens/` directories:
+
+```bash
+python -m scripts.playback_paths \
+  --map toy \
+  --map_path /tmp/mapf_toy/mapf-map/toy.map \
+  --scen_path /tmp/mapf_toy/scens/toy.scen \
+  --paths /tmp/mapf_toy/learned_paths.npy \
+  --k 3 \
+  --offset 9 \
+  --out /tmp/mapf_toy/learned.gif
+```
+
+For strict consistency with `run_cbs` and `validate_paths`, playback now uses the same raw scenario window selection by default. If you need the older “drop invalid scenario rows first” behavior, pass `--filter_invalid_scen_rows`.
+
+#### Toy smoke to full experiment
+
+The quickest end-to-end workflow is:
+
+1. Collect a small rollout-labeled dataset with `scripts.collect_cbs_dataset`
+2. Train the MLP ranker with `scripts.train_conflict_ranker`
+3. Compare `earliest` vs `learned` on held-out offsets with `scripts.eval_conflict_policies`
+4. Inspect `summary.csv` and paired GIFs for a few selected offsets
 
 ### Random Rollout
 

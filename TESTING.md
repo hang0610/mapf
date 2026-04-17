@@ -15,7 +15,7 @@ This directory contains comprehensive test files and scripts for the core MAPF u
    - Run with: `python tests/test_validate_paths.py`
 
 3. **`tests/test_cbs_learning.py`** - Smoke tests for learned CBS conflict selection
-   - Tests rollout-label supervision, model save/load, and an end-to-end `collect -> train -> run_cbs --conflict_policy learned` loop
+   - Tests rollout-label supervision, model save/load, evaluation-loss consistency, playback instance selection, and end-to-end `collect -> train -> run_cbs/eval_conflict_policies` loops
    - Run with: `python tests/test_cbs_learning.py`
 
 ### Shell Script Test Files
@@ -106,7 +106,9 @@ python tests/test_validate_paths.py
 
 - ✅ Rollout-label to effort-target conversion (`E_sum`, `E_min`, censoring)
 - ✅ Two-hidden-layer MLP export/import consistency and parameter shape checks
-- ✅ End-to-end dataset collection, training, and learned-policy CBS smoke test
+- ✅ Evaluation loss summary matches direct pairwise-loss computation
+- ✅ Playback uses the same scenario window semantics as `run_cbs` by default
+- ✅ End-to-end dataset collection, training, learned-policy CBS, and held-out batch-evaluation smoke tests
 
 ## Expected Output
 

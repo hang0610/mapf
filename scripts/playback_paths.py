@@ -2,6 +2,7 @@
 
 import argparse
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -9,6 +10,65 @@ from mapf_env.io.movingai_map import load_map
 from mapf_env.io.movingai_scene import load_scen
 from core.instance import instance_from_scen
 from mapf_env.viz.animate import animate_paths
+
+
+def default_scen_path(map_name: str, scen_dir: str) -> Path:
+    scen_dir_path = Path(scen_dir)
+    scen_files = list(scen_dir_path.glob(f"{map_name}-random-*.scen"))
+    if scen_files:
+        return scen_files[0]
+    return scen_dir_path / f"{map_name}-random-1.scen"
+
+
+def _filter_valid_scen_rows(
+    grid: np.ndarray,
+    scen_starts: np.ndarray,
+    scen_goals: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    h, w = grid.shape
+    starts_in_bounds = (
+        (scen_starts[:, 0] >= 0)
+        & (scen_starts[:, 0] < h)
+        & (scen_starts[:, 1] >= 0)
+        & (scen_starts[:, 1] < w)
+    )
+    goals_in_bounds = (
+        (scen_goals[:, 0] >= 0)
+        & (scen_goals[:, 0] < h)
+        & (scen_goals[:, 1] >= 0)
+        & (scen_goals[:, 1] < w)
+    )
+    valid_mask = starts_in_bounds & goals_in_bounds
+    if valid_mask.any():
+        valid_mask = valid_mask.copy()
+        valid_idx = np.where(valid_mask)[0]
+        valid_mask[valid_idx] = (
+            (grid[scen_starts[valid_idx, 0], scen_starts[valid_idx, 1]] == 0)
+            & (grid[scen_goals[valid_idx, 0], scen_goals[valid_idx, 1]] == 0)
+        )
+    return scen_starts[valid_mask], scen_goals[valid_mask]
+
+
+def scenario_instance(
+    grid: np.ndarray,
+    scen_starts: np.ndarray,
+    scen_goals: np.ndarray,
+    *,
+    k: int,
+    offset: int,
+    filter_invalid_rows: bool = False,
+):
+    starts = scen_starts
+    goals = scen_goals
+    if filter_invalid_rows:
+        starts, goals = _filter_valid_scen_rows(grid, scen_starts, scen_goals)
+    return instance_from_scen(
+        grid=grid,
+        scen_starts=starts,
+        scen_goals=goals,
+        k=k,
+        offset=offset,
+    )
 
 
 def main():
@@ -36,6 +96,12 @@ def main():
         type=str,
         default="data/mapf-map",
         help="Directory with .map files (default: data/mapf-map).",
+    )
+    parser.add_argument(
+        "--map_path",
+        type=str,
+        default=None,
+        help="Explicit .map path (overrides --map & --maps_dir).",
     )
     parser.add_argument(
         "--scen_dir",
@@ -78,11 +144,22 @@ def main():
         action="store_true",
         help="Disable red collision highlighting in the GIF.",
     )
+    parser.add_argument(
+        "--filter_invalid_scen_rows",
+        action="store_true",
+        help=(
+            "Drop scenario rows that are out-of-bounds or on obstacles before applying "
+            "--offset/--k. Off by default so playback matches run_cbs and validate_paths."
+        ),
+    )
 
     args = parser.parse_args()
 
     # -------- load map --------
-    map_path = Path(args.maps_dir) / f"{args.map}.map"
+    if args.map_path is not None:
+        map_path = Path(args.map_path)
+    else:
+        map_path = Path(args.maps_dir) / f"{args.map}.map"
     if not map_path.exists():
         raise FileNotFoundError(f"Map file not found: {map_path}")
 
@@ -156,80 +233,23 @@ def main():
         if args.scen_path is not None:
             scen_path = Path(args.scen_path)
         else:
-            scen_dir_path = Path(args.scen_dir)
-            scen_files = list(scen_dir_path.glob(f"{args.map}-random-*.scen"))
-            if scen_files:
-                scen_path = scen_files[0]
-            else:
-                scen_path = scen_dir_path / f"{args.map}-random-1.scen"
+            scen_path = default_scen_path(args.map, args.scen_dir)
 
         print(f"Using scen: {scen_path}")
         if not scen_path.exists():
             raise FileNotFoundError(f"Scenario file not found: {scen_path}")
 
         scen_starts, scen_goals = load_scen(scen_path)
-
-        # Filter out invalid coordinates before creating instance
-        H, W = grid.shape
-        # Check bounds for starts
-        starts_in_bounds = (
-            (scen_starts[:, 0] >= 0) & (scen_starts[:, 0] < H) &
-            (scen_starts[:, 1] >= 0) & (scen_starts[:, 1] < W)
+        instance = scenario_instance(
+            grid,
+            scen_starts,
+            scen_goals,
+            k=args.k,
+            offset=args.offset,
+            filter_invalid_rows=bool(args.filter_invalid_scen_rows),
         )
-        # Check bounds for goals
-        goals_in_bounds = (
-            (scen_goals[:, 0] >= 0) & (scen_goals[:, 0] < H) &
-            (scen_goals[:, 1] >= 0) & (scen_goals[:, 1] < W)
-        )
-        in_bounds = starts_in_bounds & goals_in_bounds
-        
-        # Check if positions are on free cells (only for in-bounds positions)
-        starts_on_free = np.ones(len(scen_starts), dtype=bool)
-        goals_on_free = np.ones(len(scen_goals), dtype=bool)
-        
-        if starts_in_bounds.any():
-            valid_starts = scen_starts[starts_in_bounds]
-            starts_on_free[starts_in_bounds] = grid[valid_starts[:, 0], valid_starts[:, 1]] == 0
-        
-        if goals_in_bounds.any():
-            valid_goals = scen_goals[goals_in_bounds]
-            goals_on_free[goals_in_bounds] = grid[valid_goals[:, 0], valid_goals[:, 1]] == 0
-        
-        # Only use positions that are in bounds AND on free cells
-        valid_mask = in_bounds & starts_on_free & goals_on_free
-        
-        if valid_mask.sum() < args.k:
-            print(f"[WARN] Only {valid_mask.sum()} valid scenario entries found, but k={args.k} requested.")
-            print(f"       Using k={valid_mask.sum()} instead.")
-            args.k = valid_mask.sum()
-        
-        if args.k > 0:
-            # Get valid entries starting from offset
-            valid_indices = np.where(valid_mask)[0]
-            if args.offset >= len(valid_indices):
-                raise ValueError(f"Offset {args.offset} is too large. Only {len(valid_indices)} valid entries available.")
-            
-            selected_indices = valid_indices[args.offset:args.offset + args.k]
-            if len(selected_indices) < args.k:
-                print(f"[WARN] Only {len(selected_indices)} valid entries available from offset {args.offset}.")
-                args.k = len(selected_indices)
-            
-            valid_starts = scen_starts[selected_indices]
-            valid_goals = scen_goals[selected_indices]
-            
-            instance = instance_from_scen(
-                grid=grid,
-                scen_starts=valid_starts,
-                scen_goals=valid_goals,
-                k=args.k,
-                offset=0,  # Already applied offset above
-            )
-
-            starts = instance.starts
-            goals = instance.goals
-        else:
-            starts = None
-            goals = None
+        starts = instance.starts
+        goals = instance.goals
 
         if N != instance.num_agents:
             print(
