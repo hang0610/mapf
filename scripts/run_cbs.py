@@ -18,7 +18,7 @@ from mapf_env.io.movingai_scene import load_scen
 from core.instance import instance_from_scen
 from core.validate import validate_paths
 from planners.cbs import CBSSolver, ConflictPolicy, RolloutLabelConfig
-from planners.conflict_ranker import LinearConflictRanker
+from planners.conflict_ranker import MLPConflictRanker
 
 
 def default_scen_path(map_name: str, scen_dir: str) -> Path:
@@ -111,7 +111,7 @@ def main() -> None:
         default="earliest",
         help=(
             "How to pick a conflict when |C(n)|>1: earliest in time/agent order, "
-            "uniform random, or a learned linear ranker."
+            "uniform random, or a learned two-hidden-layer MLP."
         ),
     )
     parser.add_argument(
@@ -199,7 +199,7 @@ def main() -> None:
     if policy == "random":
         rng = np.random.default_rng(args.seed)
 
-    learned_ranker: Optional[LinearConflictRanker] = None
+    learned_ranker: Optional[MLPConflictRanker] = None
     resolved_model_path: Optional[Path] = None
     if policy == "learned":
         if args.model_path is None:
@@ -212,7 +212,7 @@ def main() -> None:
         else:
             resolved_model_path = Path(args.model_path).expanduser().resolve()
             try:
-                learned_ranker = LinearConflictRanker.load_npz(resolved_model_path)
+                learned_ranker = MLPConflictRanker.load_npz(resolved_model_path)
             except Exception as exc:
                 print(
                     f"[WARN] failed to load learned model from {resolved_model_path}: {exc}; "

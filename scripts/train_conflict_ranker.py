@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import List
 
 from planners.conflict_ranker import (
+    compute_pairwise_loss,
     evaluate_ranker,
-    fit_linear_ranker,
+    fit_mlp_ranker,
     load_node_examples,
 )
 
@@ -23,7 +24,7 @@ def _resolve_paths(paths: List[str]) -> List[Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train a linear pairwise ranker for CBS conflict selection."
+        description="Train a two-hidden-layer MLP ranker for CBS conflict selection."
     )
     parser.add_argument(
         "--train_jsonl",
@@ -59,16 +60,34 @@ def main() -> None:
         help="Ignore pairs whose labels differ by <= delta.",
     )
     parser.add_argument(
-        "--c",
-        type=float,
-        default=1.0,
-        help="L2-regularized pairwise hinge loss coefficient.",
-    )
-    parser.add_argument(
-        "--max_iter",
+        "--epochs",
         type=int,
         default=200,
-        help="Maximum optimizer iterations for the linear ranker.",
+        help="Maximum number of training epochs for the MLP ranker.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=256,
+        help="Mini-batch size used by the MLP trainer.",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,
+        help="Adam learning rate for the MLP trainer.",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=1e-4,
+        help="L2 regularization strength for the MLP weights.",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=15,
+        help="Early stopping patience in epochs.",
     )
     parser.add_argument(
         "--random_seed",
@@ -113,11 +132,34 @@ def main() -> None:
     if not train_examples:
         raise ValueError("no usable training rows found in the provided JSONL files")
 
-    ranker, train_summary = fit_linear_ranker(
+    val_examples = (
+        load_node_examples(
+            val_paths,
+            label_key=args.label,
+            drop_feature_names=args.drop_feature,
+        )
+        if val_paths
+        else []
+    )
+    test_examples = (
+        load_node_examples(
+            test_paths,
+            label_key=args.label,
+            drop_feature_names=args.drop_feature,
+        )
+        if test_paths
+        else []
+    )
+
+    ranker, train_summary = fit_mlp_ranker(
         train_examples,
-        c=args.c,
+        val_examples=val_examples if val_examples else None,
         delta=args.delta,
-        max_iter=args.max_iter,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
         random_seed=args.random_seed,
     )
     ranker.metadata.update(
@@ -125,55 +167,63 @@ def main() -> None:
             "label_key": args.label,
             "drop_feature_names": list(args.drop_feature),
             "train_jsonl": [str(p) for p in train_paths],
+            "model_type": "mlp_2layer",
         }
     )
 
     summary = {
         "model_out": str(Path(args.model_out).expanduser().resolve()),
+        "model_type": "mlp_2layer",
         "label_key": args.label,
         "delta": args.delta,
-        "c": args.c,
-        "max_iter": args.max_iter,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "learning_rate": args.lr,
+        "weight_decay": args.weight_decay,
+        "patience": args.patience,
         "random_seed": args.random_seed,
         "drop_feature_names": list(args.drop_feature),
         "feature_names": list(ranker.feature_names),
         "train": train_summary,
     }
 
-    if val_paths:
-        val_examples = load_node_examples(
-            val_paths,
-            label_key=args.label,
-            drop_feature_names=args.drop_feature,
-        )
+    if val_examples:
         summary["val"] = evaluate_ranker(ranker, val_examples, delta=args.delta)
         summary["val"]["num_nodes"] = len(val_examples)
-
-    if test_paths:
-        test_examples = load_node_examples(
-            test_paths,
-            label_key=args.label,
-            drop_feature_names=args.drop_feature,
+        summary["val"]["pairwise_loss"] = compute_pairwise_loss(
+            ranker,
+            val_examples,
+            delta=args.delta,
         )
+
+    if test_examples:
         summary["test"] = evaluate_ranker(ranker, test_examples, delta=args.delta)
         summary["test"]["num_nodes"] = len(test_examples)
+        summary["test"]["pairwise_loss"] = compute_pairwise_loss(
+            ranker,
+            test_examples,
+            delta=args.delta,
+        )
 
     model_path = Path(args.model_out).expanduser().resolve()
     model_path.parent.mkdir(parents=True, exist_ok=True)
     ranker.save_npz(model_path)
     print(f"Saved ranker: {model_path}")
     print(
-        f"Train pairwise_accuracy={summary['train']['pairwise_accuracy']} "
+        f"Train loss={summary['train']['pairwise_loss']} "
+        f"pairwise_accuracy={summary['train']['pairwise_accuracy']} "
         f"top1_accuracy={summary['train']['top1_accuracy']}"
     )
     if "val" in summary:
         print(
-            f"Val pairwise_accuracy={summary['val']['pairwise_accuracy']} "
+            f"Val loss={summary['val']['pairwise_loss']} "
+            f"pairwise_accuracy={summary['val']['pairwise_accuracy']} "
             f"top1_accuracy={summary['val']['top1_accuracy']}"
         )
     if "test" in summary:
         print(
-            f"Test pairwise_accuracy={summary['test']['pairwise_accuracy']} "
+            f"Test loss={summary['test']['pairwise_loss']} "
+            f"pairwise_accuracy={summary['test']['pairwise_accuracy']} "
             f"top1_accuracy={summary['test']['top1_accuracy']}"
         )
 

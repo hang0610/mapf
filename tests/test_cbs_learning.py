@@ -18,9 +18,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from planners.conflict_ranker import (  # noqa: E402
-    LinearConflictRanker,
+    MLPConflictRanker,
     NodeRankingExample,
-    fit_linear_ranker,
+    fit_mlp_ranker,
     summarize_rollout_label,
 )
 
@@ -66,30 +66,65 @@ class TestCBSLearning(unittest.TestCase):
         self.assertTrue(summary["censored"])
 
     def test_ranker_roundtrip(self) -> None:
+        rows_a = np.asarray(
+            [
+                [0.1, 0.0, 0.2, 0.0, 0.2, 0.3, 0.1, 0.4, 0.2, 0.5, 0.1, 0.3, 0.2],
+                [0.8, 0.2, 0.7, 0.6, 0.7, 0.6, 0.8, 0.6, 0.7, 0.2, 0.6, 0.7, 0.5],
+                [1.0, 0.3, 0.9, 0.9, 0.8, 0.7, 0.9, 0.8, 0.8, 0.1, 0.8, 0.9, 0.7],
+            ],
+            dtype=np.float64,
+        )
+        rows_b = np.asarray(
+            [
+                [0.2, 0.1, 0.3, 0.1, 0.1, 0.2, 0.2, 0.3, 0.2, 0.4, 0.2, 0.3, 0.1],
+                [0.9, 0.3, 0.7, 0.7, 0.8, 0.7, 0.7, 0.6, 0.8, 0.1, 0.7, 0.8, 0.6],
+                [1.1, 0.4, 0.9, 0.8, 0.9, 0.8, 0.8, 0.7, 0.9, 0.1, 0.8, 0.8, 0.8],
+            ],
+            dtype=np.float64,
+        )
         examples = [
             NodeRankingExample(
-                features=np.asarray([[0.1, 0.0], [1.0, 1.0], [2.0, 2.0]], dtype=np.float64),
+                features=rows_a,
                 labels=np.asarray([1.0, 3.0, 6.0], dtype=np.float64),
-                feature_names=("f0", "f1"),
+                feature_names=tuple(f"f{i}" for i in range(rows_a.shape[1])),
             ),
             NodeRankingExample(
-                features=np.asarray([[0.2, 0.1], [1.1, 1.1], [2.1, 1.9]], dtype=np.float64),
+                features=rows_b,
                 labels=np.asarray([1.5, 3.5, 5.0], dtype=np.float64),
-                feature_names=("f0", "f1"),
+                feature_names=tuple(f"f{i}" for i in range(rows_b.shape[1])),
             ),
         ]
-        ranker, summary = fit_linear_ranker(examples, delta=0.5, max_iter=120, random_seed=0)
+        ranker, summary = fit_mlp_ranker(
+            examples,
+            delta=0.5,
+            epochs=250,
+            batch_size=8,
+            learning_rate=1e-2,
+            patience=50,
+            random_seed=0,
+        )
         self.assertIsNotNone(summary["pairwise_accuracy"])
         self.assertGreater(summary["pairwise_accuracy"], 0.8)
 
         with tempfile.TemporaryDirectory() as tmp:
             model_path = Path(tmp) / "ranker.npz"
             ranker.save_npz(model_path)
-            loaded = LinearConflictRanker.load_npz(model_path)
-            feats = np.asarray([[0.3, 0.2], [1.7, 1.6]], dtype=np.float64)
+            blob = np.load(model_path, allow_pickle=False)
+            for key in ("w1", "b1", "w2", "b2", "w3", "b3"):
+                self.assertIn(key, blob.files)
+            loaded = MLPConflictRanker.load_npz(model_path)
+            feats = np.asarray(
+                [
+                    [0.3, 0.2, 0.4, 0.1, 0.2, 0.3, 0.1, 0.4, 0.2, 0.4, 0.1, 0.2, 0.2],
+                    [1.0, 0.2, 0.8, 0.7, 0.9, 0.6, 0.7, 0.8, 0.9, 0.2, 0.7, 0.8, 0.6],
+                ],
+                dtype=np.float64,
+            )
+            scores = ranker.score_features(feats, tuple(f"f{i}" for i in range(feats.shape[1])))
+            self.assertEqual(scores.shape, (2,))
             np.testing.assert_allclose(
-                ranker.score_features(feats, ("f0", "f1")),
-                loaded.score_features(feats, ("f0", "f1")),
+                scores,
+                loaded.score_features(feats, tuple(f"f{i}" for i in range(feats.shape[1]))),
             )
 
     def test_end_to_end_collect_train_and_run(self) -> None:

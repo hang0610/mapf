@@ -105,7 +105,7 @@ python tests/test_validate_paths.py
 ### Learned CBS Tests
 
 - ✅ Rollout-label to effort-target conversion (`E_sum`, `E_min`, censoring)
-- ✅ Linear ranker export/import consistency
+- ✅ Two-hidden-layer MLP export/import consistency and parameter shape checks
 - ✅ End-to-end dataset collection, training, and learned-policy CBS smoke test
 
 ## Expected Output

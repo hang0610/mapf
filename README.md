@@ -122,7 +122,7 @@ python -m scripts.collect_cbs_dataset --map random-32-32-10 --k 10 \
   --out_dir data/cbs_learning --rollout_max_pops 500
 ```
 
-2. Train a small linear ranker:
+2. Train a small two-hidden-layer MLP ranker:
 
 ```bash
 python -m scripts.train_conflict_ranker \
@@ -148,7 +148,8 @@ If the learned model is unavailable, invalid, or cannot score a node, the solver
 - **Secondary ablation target**: `E_min(c)`, the minimum solved-side effort when at least one child solves within budget.
 - **Censoring rule**: if a child rollout times out or does not solve within the pop budget `B`, its effort is recorded as `B`.
 - **Feature names** (in `ct_run.jsonl` and exported models): `is_vertex`, `is_edge`, `t_norm`, `agent_i_norm`, `agent_j_norm`, `goal_sep_norm`, `cost_i_norm`, `cost_j_norm`, `pair_cost_share`, `inv_num_conflicts`, `depth_norm`, `soc_norm`, `free_neighbor_norm`.
-- **Training objective**: pairwise ranking with L2-regularized hinge loss on conflicts from the same CT node. The exported runtime model stores `feature_names`, `mean`, `scale`, `weights`, and `bias` in `.npz`.
+- **Model**: a small two-hidden-layer MLP (`13 -> 16 -> 8 -> 1`) with ReLU activations in the hidden layers.
+- **Training objective**: pairwise logistic ranking loss on conflicts from the same CT node. The exported runtime model stores `feature_names`, `mean`, `scale`, `w1`, `b1`, `w2`, `b2`, `w3`, and `b3` in `.npz`.
 
 ### Validate Paths
 

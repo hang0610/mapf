@@ -10,7 +10,7 @@ from .cbs import (
     space_time_astar,
 )
 from .conflict_features import FEATURE_NAMES, compute_conflict_features
-from .conflict_ranker import LinearConflictRanker, summarize_rollout_label
+from .conflict_ranker import MLPConflictRanker, summarize_rollout_label
 
 __all__ = [
     "CBSSolver",
@@ -21,7 +21,7 @@ __all__ = [
     "compute_conflict_features",
     "enumerate_conflicts",
     "FEATURE_NAMES",
-    "LinearConflictRanker",
+    "MLPConflictRanker",
     "space_time_astar",
     "summarize_rollout_label",
 ]

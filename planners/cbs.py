@@ -15,7 +15,7 @@ from planners.conflict_features import (
     compute_all_conflict_features,
     conflict_to_dict,
 )
-from planners.conflict_ranker import LinearConflictRanker
+from planners.conflict_ranker import MLPConflictRanker
 
 ConflictPolicy = Literal["earliest", "random", "learned"]
 
@@ -322,7 +322,7 @@ class CBSSolver:
         ct_log_features: bool = False,
         log_context: Optional[Dict[str, Any]] = None,
         rollout_label_config: Optional[RolloutLabelConfig] = None,
-        learned_ranker: Optional[LinearConflictRanker] = None,
+        learned_ranker: Optional[MLPConflictRanker] = None,
     ):
         self.grid = grid
         self.starts = starts.astype(int)
